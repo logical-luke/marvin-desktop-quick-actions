@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.idea/
+*.swp
+config.json
+.claude/
+CLAUDE.md

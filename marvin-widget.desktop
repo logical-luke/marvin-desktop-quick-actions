@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Marvin Tasks
+Comment=Amazing Marvin floating task widget
+Exec=/home/logical-luke/PyCharmMiscProject/marvin-desktop-quick-actions/marvin-quick-add.sh
+Icon=/home/logical-luke/PyCharmMiscProject/marvin-desktop-quick-actions/icon.png
+Terminal=false
+StartupNotify=false
+StartupWMClass=marvin-tasks
+Categories=Productivity;

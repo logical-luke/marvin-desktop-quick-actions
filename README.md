@@ -13,7 +13,6 @@ Solves the problem of Amazing Marvin's global shortcuts not working on Wayland â
 - Collapsible "Completed Today" section with undo support
 - Drag and drop to reorder tasks (synced back to Marvin)
 - Always on top, visible on all workspaces
-- System tray icon with show/hide/refresh/quit menu
 - Auto-refreshes tasks every 60 seconds
 
 ### Quick-Add Input (`Ctrl+Alt+A`)
@@ -35,7 +34,6 @@ Solves the problem of Amazing Marvin's global shortcuts not working on Wayland â
 
 - Ubuntu (tested on 25.10) with GNOME desktop
 - Python 3 with GTK3 bindings (system Python)
-- `gir1.2-ayatanaappindicator3-0.1` (for tray icon)
 - Amazing Marvin account with API access
 
 ## Installation
@@ -72,7 +70,6 @@ Solves the problem of Amazing Marvin's global shortcuts not working on Wayland â
 
 - **`Ctrl+Alt+S`** â€” Toggle the task widget
 - **`Ctrl+Alt+A`** â€” Open quick-add input (press again to dismiss)
-- Right-click the tray icon for additional options
 
 ## How It Works
 

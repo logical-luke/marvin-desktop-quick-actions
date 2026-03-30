@@ -15,6 +15,8 @@ Solves the problem of Amazing Marvin's global shortcuts not working on Wayland â
 - Always on top, visible on all workspaces
 - Auto-refreshes tasks every 60 seconds
 
+<img width="340" height="400" alt="image" src="https://github.com/user-attachments/assets/e0a1d56f-4066-4cbb-b24f-c61ed172c284" />
+
 ### Quick-Add Input (`Ctrl+Alt+A`)
 - Lightweight floating input bar for adding tasks
 - Autocomplete for all Marvin shortcut syntax:

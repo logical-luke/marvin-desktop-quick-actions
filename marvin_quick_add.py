@@ -154,8 +154,9 @@ class QuickAddWindow(Gtk.Window):
 
         self.categories = []
         self.labels = []
+        self.metadata_tags = []  # List of (trigger, value, color) for visual badges
 
-        self.set_default_size(450, 48)
+        self.set_default_size(500, 48)
         self.set_keep_above(True)
         self.set_skip_taskbar_hint(True)
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
@@ -166,7 +167,7 @@ class QuickAddWindow(Gtk.Window):
         screen = Gdk.Screen.get_default()
         monitor = screen.get_primary_monitor()
         geo = screen.get_monitor_geometry(monitor)
-        self.move(geo.x + (geo.width - 450) // 2, geo.y + 80)
+        self.move(geo.x + (geo.width - 500) // 2, geo.y + 80)
 
         self._apply_css(screen)
 
@@ -176,13 +177,22 @@ class QuickAddWindow(Gtk.Window):
         box.set_margin_start(12)
         box.set_margin_end(12)
 
+        # Entry row with tags on the right
+        entry_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.entry = Gtk.Entry()
-        self.entry.set_placeholder_text("What do you want to get done?  (#project @label +date ~30m)")
+        self.entry.set_placeholder_text("What do you want to get done?")
         self.entry.get_style_context().add_class("quick-add-entry")
+        self.entry.set_hexpand(True)
         self.entry.connect("activate", self._on_submit)
         self.entry.connect("changed", self._on_entry_changed)
         self.entry.connect("key-press-event", self._on_entry_key_press)
-        box.pack_start(self.entry, False, False, 0)
+        entry_row.pack_start(self.entry, True, True, 0)
+
+        # Container for metadata tag badges
+        self.tags_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        entry_row.pack_end(self.tags_box, False, False, 0)
+
+        box.pack_start(entry_row, False, False, 0)
 
         self.status_label = Gtk.Label()
         self.status_label.get_style_context().add_class("status-label")
@@ -224,21 +234,19 @@ class QuickAddWindow(Gtk.Window):
             .status-label {
                 font-size: 12px;
             }
+            .meta-tag {
+                background-color: #f38ba8;
+                color: #ffffff;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }
         """)
         Gtk.StyleContext.add_provider_for_screen(
             screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-    # Static suggestions for shortcuts
-    SCHEDULE_HINTS = [
-        ("tomorrow", "#89b4fa"),
-        ("today", "#89b4fa"),
-        ("next week", "#89b4fa"),
-        ("next month", "#89b4fa"),
-        ("monday", "#89b4fa"),
-        ("friday", "#89b4fa"),
-        ("none", "#585b70"),
-    ]
     DURATION_HINTS = [
         ("5m", "#f9e2af"),
         ("10m", "#f9e2af"),
@@ -262,17 +270,45 @@ class QuickAddWindow(Gtk.Window):
         ("*p0", "#585b70"),   # none
         ("*Reward", "#a6e3a1"),
     ]
-    DUE_HINTS = [
-        ("tomorrow", "#f38ba8"),
-        ("next week", "#f38ba8"),
-        ("next month", "#f38ba8"),
-        ("5d", "#f38ba8"),
-        ("none", "#585b70"),
-    ]
     PLAN_HINTS = [
         ("Next Week", "#cba6f7"),
         ("Next Month", "#cba6f7"),
     ]
+
+    @staticmethod
+    def _build_date_hints():
+        """Build dynamic date hints with actual dates like Marvin."""
+        import datetime
+        today = datetime.date.today()
+        hints = []
+        c = "#89b4fa"
+
+        hints.append((f"Today ({today.strftime('%-m/%-d/%Y')})", "today", c))
+        tom = today + datetime.timedelta(days=1)
+        hints.append((f"Tomorrow ({tom.strftime('%-m/%-d/%Y')})", "tomorrow", c))
+
+        # Next few weekdays
+        for delta in range(2, 8):
+            d = today + datetime.timedelta(days=delta)
+            name = d.strftime("%A")
+            hints.append((f"{name} ({d.strftime('%-m/%-d/%Y')})", name.lower(), c))
+
+        week = today + datetime.timedelta(weeks=1)
+        hints.append((f"In a week ({week.strftime('%-m/%-d/%Y')})", "next week", c))
+
+        # Next month
+        if today.month == 12:
+            nm = today.replace(year=today.year + 1, month=1, day=1)
+        else:
+            nm = today.replace(month=today.month + 1, day=1)
+        hints.append((f"{nm.strftime('%B')} ({nm.strftime('%-m/%-d/%Y')})", "next month", c))
+
+        # Specific date 2 weeks out
+        d2w = today + datetime.timedelta(weeks=2)
+        hints.append((f"{d2w.strftime('%-m/%-d/%Y')} ({d2w.strftime('%A')})", d2w.isoformat(), c))
+
+        hints.append(("none", "none", "#585b70"))
+        return hints
 
     def _fetch_autocomplete_data(self):
         def fetch():
@@ -348,7 +384,6 @@ class QuickAddWindow(Gtk.Window):
                 if q in c["title"].lower()
             ]
         if trigger == "##":
-            # Goals — currently not fetched, pass through to server
             return []
         if trigger == "@":
             return [
@@ -356,10 +391,9 @@ class QuickAddWindow(Gtk.Window):
                 for l in self.labels
                 if q in l["title"].lower()
             ]
-        if trigger == "+":
-            return [(t, c) for t, c in self.SCHEDULE_HINTS if q in t.lower()]
-        if trigger in ("due", "starts", "ends", "review"):
-            return [(t, c) for t, c in self.DUE_HINTS if q in t.lower()]
+        if trigger == "+" or trigger in ("due", "starts", "ends", "review"):
+            date_hints = self._build_date_hints()
+            return [(display, c) for display, val, c in date_hints if q in display.lower() or q in val.lower()]
         if trigger == "~":
             return [(t, c) for t, c in self.DURATION_HINTS if q in t.lower()]
         if trigger == "!":
@@ -375,21 +409,94 @@ class QuickAddWindow(Gtk.Window):
         text = self.entry.get_text()
         cursor = self.entry.get_position()
 
-        if trigger in ("due", "starts", "ends", "review"):
-            # Keyword triggers include the keyword itself
-            prefix = trigger + " "
-        elif trigger == "*" and selected.startswith("*"):
-            # Priority/reward: replace the whole *token
-            prefix = ""
-        else:
-            prefix = trigger
+        # For date hints, extract the value (e.g. "Tomorrow (3/31/2026)" -> "tomorrow")
+        date_hints = self._build_date_hints()
+        date_val = None
+        for display, val, _ in date_hints:
+            if display == selected:
+                date_val = val
+                break
 
+        # Build the shortcut string for the API
+        if trigger in ("due", "starts", "ends", "review"):
+            shortcut_str = f"{trigger} {date_val or selected}"
+        elif trigger == "*" and selected.startswith("*"):
+            shortcut_str = selected
+        elif trigger == "+" and date_val:
+            shortcut_str = f"+{date_val}"
+        else:
+            shortcut_str = f"{trigger}{selected}"
+
+        # Determine tag display and color
+        color = "#f38ba8"  # default pink
+        if trigger == "#":
+            tag_display = f"in {selected}"
+            cat = next((c for c in self.categories if c["title"] == selected), None)
+            if cat:
+                color = cat["color"]
+        elif trigger == "@":
+            tag_display = f"@{selected}"
+            lbl = next((l for l in self.labels if l["title"] == selected), None)
+            if lbl:
+                color = lbl["color"]
+        elif trigger in ("+", "due", "starts", "ends", "review"):
+            label = date_val or selected
+            if trigger == "+":
+                tag_display = f"scheduled {label}"
+            else:
+                tag_display = f"{trigger} {label}"
+            color = "#89b4fa"
+        elif trigger == "~":
+            tag_display = f"~{selected}"
+            color = "#f9e2af"
+        elif trigger == "!":
+            tag_display = f"!{selected}"
+            color = "#fab387"
+        elif trigger == "*":
+            tag_display = selected
+            color = "#f38ba8"
+        elif trigger == "&":
+            tag_display = f"&{selected}"
+            color = "#cba6f7"
+        else:
+            tag_display = shortcut_str
+
+        # Remove the trigger text from input
         after = text[cursor:]
-        new_text = text[:token_start] + prefix + selected + " " + after
-        new_cursor = token_start + len(prefix) + len(selected) + 1
-        self.entry.set_text(new_text)
-        self.entry.set_position(new_cursor)
+        new_text = text[:token_start].rstrip() + " " + after.lstrip()
+        new_text = " ".join(new_text.split())  # collapse whitespace
+        self.entry.handler_block_by_func(self._on_entry_changed)
+        self.entry.set_text(new_text.strip())
+        self.entry.set_position(len(new_text.strip()))
+        self.entry.handler_unblock_by_func(self._on_entry_changed)
+
+        # Store metadata
+        self.metadata_tags.append((shortcut_str, tag_display, color))
+        self._render_tags()
         self.autocomplete.hide()
+
+    def _render_tags(self):
+        """Render metadata tags as visual badges next to the input."""
+        for child in self.tags_box.get_children():
+            self.tags_box.remove(child)
+        for shortcut_str, display, color in self.metadata_tags:
+            badge = Gtk.Label(label=display)
+            badge_css = Gtk.CssProvider()
+            badge_css.load_from_data(
+                f".meta-tag {{ background-color: {color}; color: #ffffff; "
+                f"border-radius: 4px; padding: 4px 8px; font-size: 12px; font-weight: bold; }}".encode()
+            )
+            badge.get_style_context().add_provider(badge_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            badge.get_style_context().add_class("meta-tag")
+            self.tags_box.pack_start(badge, False, False, 0)
+        self.tags_box.show_all()
+
+    def _build_submit_title(self):
+        """Build the full title with shortcut strings appended for the API."""
+        title = self.entry.get_text().strip()
+        for shortcut_str, _, _ in self.metadata_tags:
+            title += " " + shortcut_str
+        return title
 
     def _on_entry_key_press(self, widget, event):
         if self.autocomplete.get_visible():
@@ -416,8 +523,8 @@ class QuickAddWindow(Gtk.Window):
     def _on_submit(self, widget):
         if self.autocomplete.get_visible():
             return
-        title = self.entry.get_text().strip()
-        if not title:
+        full_title = self._build_submit_title()
+        if not full_title.strip():
             return
 
         self.entry.set_sensitive(False)
@@ -425,16 +532,19 @@ class QuickAddWindow(Gtk.Window):
 
         def do_add():
             try:
-                api_post("addTask", {"title": title})
-                GLib.idle_add(self._on_task_added, title)
+                api_post("addTask", {"title": full_title})
+                GLib.idle_add(self._on_task_added, full_title)
             except Exception as e:
                 GLib.idle_add(self._on_task_error, str(e))
 
         threading.Thread(target=do_add, daemon=True).start()
 
     def _on_task_added(self, title):
-        self._set_status(f"Added: {title}", "#a6e3a1")
+        display = self.entry.get_text().strip() or title
+        self._set_status(f"Added: {display}", "#a6e3a1")
         self.entry.set_text("")
+        self.metadata_tags.clear()
+        self._render_tags()
         self.entry.set_sensitive(True)
         self.entry.grab_focus()
         # Signal the widget to refresh its task list

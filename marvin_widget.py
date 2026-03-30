@@ -245,6 +245,7 @@ class DataStore:
             for l in labels
         ]
         self.category_map = {c["id"]: c for c in self.categories}
+        self.category_name_map = {c["title"].lower(): c for c in self.categories}
         if self.on_update:
             self.on_update()
 
@@ -255,6 +256,36 @@ class DataStore:
         self.tasks_loaded = True
         if self.on_update:
             self.on_update()
+
+
+import re
+
+_SHORTCUT_PATTERNS = [
+    r'##\S+',                          # ##goal
+    r'#\S+',                           # #project
+    r'@\S+',                           # @label
+    r'\+\S+',                          # +tomorrow
+    r'~\d+[hm]\S*',                    # ~30m, ~1h30m
+    r'!\S+',                           # !morning
+    r'\*p[0-3]',                       # *p1
+    r'\*[Rr]eward',                    # *Reward
+    r'\$\d+',                          # $5
+    r'&\S+(?:\s+\S+)?',               # &Next Week
+    r'\bdue\s+\S+(?:\s+\S+)?',        # due next week
+    r'\bstarts\s+\S+(?:\s+\S+)?',     # starts next month
+    r'\bends\s+\S+(?:\s+\S+)?',       # ends next month
+    r'\breview\s+\S+',                 # review 2026-04-01
+    r'\|\d+d',                         # |5d
+    r'=\d+d',                          # =5d
+    r'--\S.*',                         # --note text
+]
+_SHORTCUT_RE = re.compile('|'.join(f'(?:{p})' for p in _SHORTCUT_PATTERNS))
+
+
+def _clean_title(title):
+    """Strip shortcut syntax from a task title for display."""
+    cleaned = _SHORTCUT_RE.sub('', title)
+    return ' '.join(cleaned.split()).strip()
 
 
 def _parse_color(hex_color):
@@ -540,7 +571,7 @@ class MarvinWidget(Gtk.Window):
         hbox.pack_start(check_btn, False, False, 0)
 
         # Title
-        title_label = Gtk.Label(label=task.get("title", ""))
+        title_label = Gtk.Label(label=_clean_title(task.get("title", "")))
         title_label.get_style_context().add_class("task-title")
         title_label.set_halign(Gtk.Align.START)
         title_label.set_line_wrap(True)
@@ -552,7 +583,7 @@ class MarvinWidget(Gtk.Window):
 
         # Category badge — colored pill like Marvin
         parent_id = task.get("parentId")
-        cat = self.store.category_map.get(parent_id)
+        cat = self._resolve_category(parent_id)
         if cat:
             badge = Gtk.Label()
             color = cat["color"]
@@ -572,6 +603,19 @@ class MarvinWidget(Gtk.Window):
 
         frame.add(vbox)
         return frame
+
+    def _resolve_category(self, parent_id):
+        """Resolve parentId to category — handles both IDs and #Name shortcuts."""
+        if not parent_id:
+            return None
+        cat = self.store.category_map.get(parent_id)
+        if cat:
+            return cat
+        # parentId might be "#Name" from shortcut syntax
+        if parent_id.startswith("#"):
+            name = parent_id[1:].lower()
+            return self.store.category_name_map.get(name)
+        return None
 
     def _toggle_completed(self, btn):
         self.completed_expanded = not self.completed_expanded
@@ -616,7 +660,7 @@ class MarvinWidget(Gtk.Window):
         hbox.pack_start(check_btn, False, False, 0)
 
         # Title (grayed out)
-        title_label = Gtk.Label(label=task.get("title", ""))
+        title_label = Gtk.Label(label=_clean_title(task.get("title", "")))
         title_label.get_style_context().add_class("done-title")
         title_label.set_halign(Gtk.Align.START)
         title_label.set_line_wrap(True)
@@ -628,7 +672,7 @@ class MarvinWidget(Gtk.Window):
 
         # Category badge
         parent_id = task.get("parentId")
-        cat = self.store.category_map.get(parent_id)
+        cat = self._resolve_category(parent_id)
         if cat:
             badge = Gtk.Label()
             color = cat["color"]

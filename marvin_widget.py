@@ -110,6 +110,25 @@ class MarvinAPI:
             ],
         }, use_full_token=True)
 
+    def add_task(self, title, parent_id=None, day=None):
+        data = {"title": title}
+        if parent_id:
+            data["parentId"] = parent_id
+        if day:
+            data["day"] = day
+        return self._request("POST", "addTask", data)
+
+    def update_task(self, task_id, setters):
+        return self._request("POST", "doc/update", {
+            "itemId": task_id,
+            "setters": [{"key": k, "val": v} for k, v in setters.items()],
+        }, use_full_token=True)
+
+    def delete_task(self, task_id):
+        return self._request("POST", "doc/delete", {
+            "itemId": task_id,
+        }, use_full_token=True)
+
     def update_rank(self, task_id, new_rank):
         return self._request("POST", "doc/update", {
             "itemId": task_id,
@@ -224,9 +243,9 @@ class DataStore:
     def _poll_tasks(self):
         def fetch():
             try:
-                tasks = self.api.get_today_tasks()
                 import time
-                time.sleep(3)  # Rate limit between reads
+                tasks = self.api.get_today_tasks()
+                time.sleep(3)
                 done = self.api.get_done_today()
                 GLib.idle_add(self._update_tasks, tasks, done)
             except Exception as e:
@@ -380,6 +399,18 @@ class MarvinWidget(Gtk.Window):
                 border-color: #5bdb66;
                 color: transparent;
             }
+            menu, menuitem {
+                background-color: #202125;
+                color: #d8d8d4;
+                font-size: 13px;
+            }
+            menuitem:hover {
+                background-color: #3b3b3b;
+            }
+            separator {
+                background-color: #383838;
+                min-height: 1px;
+            }
             .done-check {
                 color: #5bdb66;
                 font-size: 16px;
@@ -432,12 +463,15 @@ class MarvinWidget(Gtk.Window):
         title.set_halign(Gtk.Align.START)
         header_box.pack_start(title, True, True, 0)
         self.header_title = title
-        # Refresh button
-        refresh_btn = Gtk.Button(label="\u21bb")
-        refresh_btn.get_style_context().add_class("header-btn")
-        refresh_btn.set_relief(Gtk.ReliefStyle.NONE)
-        refresh_btn.connect("clicked", lambda b: self.store.refresh_tasks_now())
-        header_box.pack_end(refresh_btn, False, False, 0)
+        # Refresh button / spinner
+        self.refresh_btn = Gtk.Button(label="\u21bb")
+        self.refresh_btn.get_style_context().add_class("header-btn")
+        self.refresh_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.refresh_btn.connect("clicked", lambda b: self._on_refresh_click())
+        header_box.pack_end(self.refresh_btn, False, False, 0)
+        self.refresh_spinner = Gtk.Spinner()
+        self.refresh_spinner.set_no_show_all(True)
+        header_box.pack_end(self.refresh_spinner, False, False, 4)
         # Hide button
         hide_btn = Gtk.Button(label="\u2013")
         hide_btn.get_style_context().add_class("header-btn")
@@ -490,9 +524,20 @@ class MarvinWidget(Gtk.Window):
 
     # ── Task list rendering ──────────────────────────────────────────────
 
+    def _on_refresh_click(self):
+        self.refresh_btn.hide()
+        self.refresh_spinner.show()
+        self.refresh_spinner.start()
+        self.store.refresh_tasks_now()
+
     def _on_data_updated(self):
+        # Stop refresh spinner
+        self.refresh_spinner.stop()
+        self.refresh_spinner.hide()
+        self.refresh_btn.show()
+
         if not self.store.tasks_loaded:
-            return  # Wait for tasks to load before rendering
+            return
         self._initial_load = False
         self._render_tasks()
 
@@ -558,6 +603,9 @@ class MarvinWidget(Gtk.Window):
         frame.drag_dest_add_text_targets()
         frame.connect("drag-data-received", self._on_drag_data_received)
 
+        # Right-click context menu
+        frame.connect("button-press-event", lambda w, e, t=task: self._on_task_right_click(w, e, t))
+
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
@@ -600,6 +648,35 @@ class MarvinWidget(Gtk.Window):
             badge.set_margin_start(28)
             badge.set_margin_top(2)
             vbox.pack_start(badge, False, False, 0)
+
+        # Inline subtasks (dict of id -> {_id, title, done, rank})
+        subtasks_dict = task.get("subtasks") or {}
+        children = sorted(
+            [s for s in subtasks_dict.values() if not s.get("done")],
+            key=lambda s: s.get("rank", 0)
+        )
+        if children:
+            for child in children:
+                sub_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                sub_hbox.set_margin_start(28)
+                sub_hbox.set_margin_top(4)
+
+                sub_check = Gtk.Button(label=" ")
+                sub_check.get_style_context().add_class("task-check")
+                sub_check.set_relief(Gtk.ReliefStyle.NONE)
+                sub_check.set_valign(Gtk.Align.CENTER)
+                child_id = child.get("_id")
+                task_id = task.get("_id")
+                sub_check.connect("clicked", lambda b, tid=task_id, cid=child_id: self._on_subtask_check(tid, cid))
+                sub_hbox.pack_start(sub_check, False, False, 0)
+
+                sub_title = Gtk.Label(label=_clean_title(child.get("title", "")))
+                sub_title.get_style_context().add_class("task-title")
+                sub_title.set_halign(Gtk.Align.START)
+                sub_title.set_xalign(0)
+                sub_hbox.pack_start(sub_title, True, True, 0)
+
+                vbox.pack_start(sub_hbox, False, False, 0)
 
         frame.add(vbox)
         return frame
@@ -714,6 +791,193 @@ class MarvinWidget(Gtk.Window):
         if source_id and source_id != widget.task_id:
             self.store.reorder_tasks(source_id, target_index)
 
+    # ── Right-click context menu ───────────────────────────────────────
+
+    def _on_task_right_click(self, widget, event, task):
+        if event.button != 3:  # Right click only
+            return False
+        menu = Gtk.Menu()
+        task_id = task.get("_id")
+        title = task.get("title", "")
+
+        # Mark done
+        item = Gtk.MenuItem(label="\u2714  Mark done")
+        item.connect("activate", lambda w: self._on_task_check(task_id))
+        menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Add subtask
+        item = Gtk.MenuItem(label="\u2795  Add subtask")
+        item.connect("activate", lambda w: self._show_input_dialog(
+            "Add subtask", "", lambda text: self._action_add_subtask(task_id, text)))
+        menu.append(item)
+
+        # Edit note
+        item = Gtk.MenuItem(label="\U0001F4DD  Edit note")
+        item.connect("activate", lambda w: self._show_input_dialog(
+            "Edit note", task.get("note", "") or "", lambda text: self._action_update(task_id, {"note": text})))
+        menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Move to (category submenu)
+        move_item = Gtk.MenuItem(label="#  Move to")
+        move_menu = Gtk.Menu()
+        for cat in self.store.categories:
+            cat_item = Gtk.MenuItem(label=cat["title"])
+            cat_id = cat["id"]
+            cat_item.connect("activate", lambda w, cid=cat_id: self._action_update(task_id, {"parentId": cid}))
+            move_menu.append(cat_item)
+        move_item.set_submenu(move_menu)
+        menu.append(move_item)
+
+        # Schedule (date submenu)
+        sched_item = Gtk.MenuItem(label="\U0001F4C5  Schedule")
+        sched_menu = Gtk.Menu()
+        today = datetime.date.today()
+        for label, delta in [("Today", 0), ("Tomorrow", 1), ("In 2 days", 2),
+                             ("Friday", (4 - today.weekday()) % 7 or 7),
+                             ("Next week", 7), ("Unschedule", None)]:
+            si = Gtk.MenuItem(label=label)
+            if delta is not None:
+                d = (today + datetime.timedelta(days=delta)).isoformat()
+                si.connect("activate", lambda w, day=d: self._action_update(task_id, {"day": day}))
+            else:
+                si.connect("activate", lambda w: self._action_update(task_id, {"day": "unassigned"}))
+            sched_menu.append(si)
+        sched_item.set_submenu(sched_menu)
+        menu.append(sched_item)
+
+        # Set deadline
+        item = Gtk.MenuItem(label="\u23F0  Set deadline")
+        deadline_menu = Gtk.Menu()
+        for label, delta in [("Tomorrow", 1), ("In 3 days", 3), ("In a week", 7),
+                             ("In 2 weeks", 14), ("In a month", 30), ("Remove", None)]:
+            di = Gtk.MenuItem(label=label)
+            if delta is not None:
+                d = (today + datetime.timedelta(days=delta)).isoformat()
+                di.connect("activate", lambda w, dd=d: self._action_update(task_id, {"dueDate": dd}))
+            else:
+                di.connect("activate", lambda w: self._action_update(task_id, {"dueDate": None}))
+            deadline_menu.append(di)
+        item.set_submenu(deadline_menu)
+        menu.append(item)
+
+        # Set duration
+        item = Gtk.MenuItem(label="\u23F1  Set duration")
+        dur_menu = Gtk.Menu()
+        for label, ms in [("5 min", 300000), ("10 min", 600000), ("15 min", 900000),
+                          ("30 min", 1800000), ("45 min", 2700000), ("1 hour", 3600000),
+                          ("1.5 hours", 5400000), ("2 hours", 7200000), ("3 hours", 10800000),
+                          ("Remove", 0)]:
+            di = Gtk.MenuItem(label=label)
+            di.connect("activate", lambda w, m=ms: self._action_update(task_id, {"timeEstimate": m}))
+            dur_menu.append(di)
+        item.set_submenu(dur_menu)
+        menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Delete
+        item = Gtk.MenuItem(label="\U0001F5D1  Delete")
+        item.connect("activate", lambda w: self._action_delete(task_id))
+        menu.append(item)
+
+        menu.show_all()
+        menu.popup(None, None, None, None, event.button, event.time)
+        return True
+
+    def _show_input_dialog(self, title, default_text, callback):
+        dialog = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dialog.set_decorated(False)
+        dialog.set_default_size(300, -1)
+
+        content = dialog.get_content_area()
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        entry = Gtk.Entry()
+        entry.set_text(default_text)
+        entry.connect("activate", lambda e: dialog.response(Gtk.ResponseType.OK))
+        content.pack_start(entry, False, False, 0)
+
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.show_all()
+
+        response = dialog.run()
+        text = entry.get_text().strip()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.OK and text:
+            callback(text)
+
+    def _action_add_subtask(self, parent_id, title):
+        def do_add():
+            try:
+                today = datetime.date.today().isoformat()
+                self.store.api.add_task(title, parent_id=parent_id, day=today)
+                import time
+                time.sleep(3)
+                GLib.idle_add(self.store.refresh_tasks_now)
+            except Exception as e:
+                print(f"Failed to add subtask: {e}", file=sys.stderr)
+
+        threading.Thread(target=do_add, daemon=True).start()
+
+    def _action_update(self, task_id, setters):
+        # Optimistic: if rescheduling away from today, remove from list
+        removes_from_today = "day" in setters and setters["day"] != datetime.date.today().isoformat()
+        if removes_from_today:
+            self.store.tasks = [t for t in self.store.tasks if t.get("_id") != task_id]
+            self._render_tasks()
+
+        def do_update():
+            try:
+                self.store.api.update_task(task_id, setters)
+            except Exception as e:
+                print(f"Failed to update task: {e}", file=sys.stderr)
+                if removes_from_today:
+                    GLib.idle_add(self.store.refresh_tasks_now)
+
+        threading.Thread(target=do_update, daemon=True).start()
+
+    def _action_delete(self, task_id):
+        # Optimistic remove
+        self.store.tasks = [t for t in self.store.tasks if t.get("_id") != task_id]
+        self._render_tasks()
+
+        def do_delete():
+            try:
+                self.store.api.delete_task(task_id)
+            except Exception as e:
+                print(f"Failed to delete task: {e}", file=sys.stderr)
+                GLib.idle_add(self.store.refresh_tasks_now)
+
+        threading.Thread(target=do_delete, daemon=True).start()
+
+    def _on_subtask_check(self, task_id, subtask_id):
+        """Mark an inline subtask as done."""
+        # Optimistic update
+        for t in self.store.tasks:
+            if t.get("_id") == task_id:
+                subs = t.get("subtasks", {})
+                if subtask_id in subs:
+                    subs[subtask_id]["done"] = True
+                break
+        self._render_tasks()
+
+        def do_update():
+            try:
+                self.store.api.update_task(task_id, {f"subtasks.{subtask_id}.done": True})
+            except Exception as e:
+                print(f"Failed to mark subtask done: {e}", file=sys.stderr)
+
+        threading.Thread(target=do_update, daemon=True).start()
+
     def _on_task_check(self, task_id):
         self.store.mark_task_done(task_id)
 
@@ -822,8 +1086,25 @@ def main():
     def on_sigusr1(signum, frame):
         GLib.idle_add(widget.toggle_visibility)
 
+    QUICK_ADD_DIR = os.path.expanduser("~/.cache/marvin-quick-add")
+
     def on_sigusr2(signum, frame):
-        GLib.idle_add(store.refresh_tasks_now)
+        def handle():
+            # Read all pending task files
+            import glob
+            for fpath in glob.glob(os.path.join(QUICK_ADD_DIR, "task_*.json")):
+                try:
+                    with open(fpath) as f:
+                        task_data = json.load(f)
+                    os.remove(fpath)
+                    store.tasks.append(task_data)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if store.on_update:
+                store.on_update()
+            # Background refresh to get real data from API
+            store.refresh_tasks_now()
+        GLib.idle_add(handle)
 
     signal.signal(signal.SIGUSR1, on_sigusr1)
     signal.signal(signal.SIGUSR2, on_sigusr2)

@@ -527,6 +527,7 @@ class QuickAddWindow(Gtk.Window):
         if not full_title.strip():
             return
 
+        self._last_display_title = self.entry.get_text().strip()
         self.entry.set_sensitive(False)
         self._set_status("Adding...", "#a6adc8")
 
@@ -540,20 +541,46 @@ class QuickAddWindow(Gtk.Window):
         threading.Thread(target=do_add, daemon=True).start()
 
     def _on_task_added(self, title):
-        display = self.entry.get_text().strip() or title
+        display = self._last_display_title or title
         self._set_status(f"Added: {display}", "#a6e3a1")
+        # Signal the widget with the actual display title and tags before clearing
+        self._notify_widget_refresh(display, list(self.metadata_tags))
         self.entry.set_text("")
         self.metadata_tags.clear()
         self._render_tags()
         self.entry.set_sensitive(True)
         self.entry.grab_focus()
-        # Signal the widget to refresh its task list
-        self._notify_widget_refresh()
         GLib.timeout_add(800, Gtk.main_quit)
 
-    @staticmethod
-    def _notify_widget_refresh():
-        """Send SIGUSR2 to the running widget to trigger a task refresh."""
+    def _notify_widget_refresh(self, display_title, tags):
+        """Write optimistic task data and send SIGUSR2 to the widget."""
+        import json as _json
+        import datetime as _dt
+        import uuid
+
+        parent_id = "unassigned"
+        for shortcut_str, _, _ in tags:
+            if shortcut_str.startswith("#") and not shortcut_str.startswith("##"):
+                parent_id = shortcut_str
+                break
+
+        placeholder = {
+            "_id": f"_pending_{uuid.uuid4().hex[:8]}",
+            "title": display_title,
+            "parentId": parent_id,
+            "day": _dt.date.today().isoformat(),
+            "done": False,
+        }
+
+        cache_dir = os.path.expanduser("~/.cache/marvin-quick-add")
+        os.makedirs(cache_dir, exist_ok=True)
+        task_file = os.path.join(cache_dir, f"task_{uuid.uuid4().hex[:8]}.json")
+        try:
+            with open(task_file, "w") as f:
+                _json.dump(placeholder, f)
+        except OSError:
+            pass
+
         widget_pidfile = os.path.expanduser("~/.cache/marvin-widget.pid")
         try:
             with open(widget_pidfile) as f:

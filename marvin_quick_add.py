@@ -9,6 +9,8 @@ import signal
 import os
 import sys
 
+os.environ["GDK_BACKEND"] = "x11"  # Force XWayland so move() works on GNOME Wayland
+
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, Pango
@@ -167,7 +169,8 @@ class QuickAddWindow(Gtk.Window):
         screen = Gdk.Screen.get_default()
         monitor = screen.get_primary_monitor()
         geo = screen.get_monitor_geometry(monitor)
-        self.move(geo.x + (geo.width - 500) // 2, geo.y + 80)
+        self.move(geo.x + (geo.width - 500) // 2, geo.y + geo.height - 160)
+        self.set_keep_above(True)
 
         self._apply_css(screen)
 
@@ -216,7 +219,6 @@ class QuickAddWindow(Gtk.Window):
         css.load_from_data(b"""
             window {
                 background-color: #1e1e2e;
-                border-radius: 12px;
                 border: 1px solid #444;
             }
             .quick-add-entry {
@@ -650,6 +652,7 @@ def main():
     win = QuickAddWindow()
     win.show_all()
     win.status_label.hide()
+    win.present_with_time(Gdk.CURRENT_TIME)
     win.entry.grab_focus()
 
     def on_sigusr1(signum, frame):

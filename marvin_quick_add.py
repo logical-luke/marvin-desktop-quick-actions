@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.13
 """Amazing Marvin Quick-Add — lightweight floating input with autocomplete."""
 
 import gi
@@ -8,24 +8,39 @@ import threading
 import signal
 import os
 import sys
+import subprocess
+import base64
+import tempfile
+import shutil
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 os.environ["GDK_BACKEND"] = "x11"  # Force XWayland so move() works on GNOME Wayland
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gtk, Gdk, GLib, Pango
+from gi.repository import Gtk, Gdk, GLib, Pango, Gio
 
 API_BASE = "https://serv.amazingmarvin.com/api"
 CONFIG_PATH = os.path.expanduser("~/.config/marvin-widget/config.json")
 
 
-def load_token():
+def load_config():
     try:
         with open(CONFIG_PATH) as f:
-            return json.load(f).get("api_token", "")
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    token = os.environ.get("MARVIN_API_TOKEN", "")
+        return {}
+
+
+def load_token():
+    config = load_config()
+    token = config.get("api_token", "") or os.environ.get("MARVIN_API_TOKEN", "")
     if not token:
         print(f"Error: No API token. Set 'api_token' in {CONFIG_PATH}", file=sys.stderr)
         sys.exit(1)
@@ -33,6 +48,7 @@ def load_token():
 
 
 API_TOKEN = None  # Set in main()
+ANTHROPIC_API_KEY = None  # Set in main()
 
 
 def api_get(path):
@@ -158,21 +174,25 @@ class QuickAddWindow(Gtk.Window):
         self.labels = []
         self.metadata_tags = []  # List of (trigger, value, color) for visual badges
 
-        self.set_default_size(500, 48)
+        self.set_default_size(600, 48)
+        self.set_size_request(600, -1)
+        self.set_resizable(True)
+        self.set_gravity(Gdk.Gravity.SOUTH)
         self.set_keep_above(True)
         self.set_skip_taskbar_hint(True)
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         self.set_decorated(False)
-        self.set_resizable(False)
 
-        # Position top-center
-        screen = Gdk.Screen.get_default()
-        monitor = screen.get_primary_monitor()
-        geo = screen.get_monitor_geometry(monitor)
-        self.move(geo.x + (geo.width - 500) // 2, geo.y + geo.height - 160)
+        # Position bottom-center (grows upward)
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        geo = monitor.get_geometry()
+        self._monitor_geo = geo
+        self._bottom_margin = 100  # pixels from bottom of screen (matches main widget)
+        self._reposition_window(48)
         self.set_keep_above(True)
 
-        self._apply_css(screen)
+        self._apply_css(Gdk.Screen.get_default())
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_top(8)
@@ -191,11 +211,32 @@ class QuickAddWindow(Gtk.Window):
         self.entry.connect("key-press-event", self._on_entry_key_press)
         entry_row.pack_start(self.entry, True, True, 0)
 
+        # Screenshot button
+        screenshot_btn = Gtk.Button(label="\U0001f4f7")
+        screenshot_btn.set_tooltip_text("Screenshot OCR (Ctrl+Shift+S)")
+        screenshot_btn.get_style_context().add_class("screenshot-btn")
+        screenshot_btn.connect("clicked", lambda b: self._on_screenshot_ocr())
+        entry_row.pack_end(screenshot_btn, False, False, 0)
+
         # Container for metadata tag badges
         self.tags_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         entry_row.pack_end(self.tags_box, False, False, 0)
 
-        box.pack_start(entry_row, False, False, 0)
+        # Notes field (Ctrl+N to toggle) — above entry so it expands upward
+        self.notes_scroll = Gtk.ScrolledWindow()
+        self.notes_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.notes_scroll.set_min_content_height(60)
+        self.notes_scroll.set_max_content_height(120)
+        self.notes_scroll.set_propagate_natural_height(True)
+        self.notes_scroll.set_no_show_all(True)
+        self.notes_view = Gtk.TextView()
+        self.notes_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.notes_view.get_style_context().add_class("notes-field")
+        self.notes_view.connect("key-press-event", self._on_notes_key_press)
+        buf = self.notes_view.get_buffer()
+        buf.connect("changed", self._on_notes_buffer_changed)
+        self.notes_scroll.add(self.notes_view)
+        box.pack_start(self.notes_scroll, False, False, 0)
 
         self.status_label = Gtk.Label()
         self.status_label.get_style_context().add_class("status-label")
@@ -204,15 +245,38 @@ class QuickAddWindow(Gtk.Window):
         self.status_label.set_no_show_all(True)
         box.pack_start(self.status_label, False, False, 0)
 
+        box.pack_start(entry_row, False, False, 0)
+
         self.add(box)
 
         self.autocomplete = AutocompletePopup(self)
 
-        self.connect("focus-out-event", self._on_focus_out)
-        self.connect("delete-event", lambda w, e: Gtk.main_quit() or True)
+        self.connect("delete-event", lambda w, e: self.hide() or True)
+
+        self._base_height = None  # captured after first render
 
         # Fetch categories/labels in background
         self._fetch_autocomplete_data()
+
+        # Show default "today" tag
+        self._ensure_default_today_tag()
+
+        # Capture actual base height after first render
+        def _capture_base_height():
+            self._base_height = self.get_allocated_height()
+            return False
+        GLib.idle_add(_capture_base_height)
+
+    def _ensure_default_today_tag(self):
+        """Add a default 'scheduled today' tag if no date tag is present."""
+        import datetime as _dt
+        has_date = any(
+            s.startswith("+") or s.startswith("due ") or s.startswith("starts ") or s.startswith("ends ")
+            for s, _, _ in self.metadata_tags
+        )
+        if not has_date:
+            self.metadata_tags.append(("+today", "today", "#89b4fa"))
+            self._render_tags()
 
     def _apply_css(self, screen):
         css = Gtk.CssProvider()
@@ -243,6 +307,34 @@ class QuickAddWindow(Gtk.Window):
                 padding: 4px 8px;
                 font-size: 12px;
                 font-weight: bold;
+            }
+            .notes-field text {
+                background-color: #313244;
+                color: #cdd6f4;
+                caret-color: #cdd6f4;
+            }
+            .notes-field {
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 2px;
+                font-size: 13px;
+            }
+            .notes-field:focus-within {
+                border-color: #89b4fa;
+            }
+            .screenshot-btn {
+                background: transparent;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: #cdd6f4;
+                font-size: 14px;
+                min-width: 0;
+                min-height: 0;
+            }
+            .screenshot-btn:hover {
+                background-color: #45475a;
+                border-color: #89b4fa;
             }
         """)
         Gtk.StyleContext.add_provider_for_screen(
@@ -444,7 +536,7 @@ class QuickAddWindow(Gtk.Window):
         elif trigger in ("+", "due", "starts", "ends", "review"):
             label = date_val or selected
             if trigger == "+":
-                tag_display = f"scheduled {label}"
+                tag_display = label
             else:
                 tag_display = f"{trigger} {label}"
             color = "#89b4fa"
@@ -472,7 +564,19 @@ class QuickAddWindow(Gtk.Window):
         self.entry.set_position(len(new_text.strip()))
         self.entry.handler_unblock_by_func(self._on_entry_changed)
 
-        # Store metadata
+        # Replace existing tag of same type (category, date, etc.)
+        # These triggers should only have one active tag at a time
+        UNIQUE_TRIGGERS = {
+            "#": lambda s: s.startswith("#") and not s.startswith("##"),
+            "+": lambda s: s.startswith("+"),
+            "due": lambda s: s.startswith("due "),
+            "starts": lambda s: s.startswith("starts "),
+            "ends": lambda s: s.startswith("ends "),
+        }
+        matcher = UNIQUE_TRIGGERS.get(trigger)
+        if matcher:
+            self.metadata_tags = [(s, d, c) for s, d, c in self.metadata_tags if not matcher(s)]
+
         self.metadata_tags.append((shortcut_str, tag_display, color))
         self._render_tags()
         self.autocomplete.hide()
@@ -493,6 +597,118 @@ class QuickAddWindow(Gtk.Window):
             self.tags_box.pack_start(badge, False, False, 0)
         self.tags_box.show_all()
 
+    def _on_notes_buffer_changed(self, buf):
+        """Placeholder handled via CSS if needed — stub for future use."""
+        pass
+
+    def _on_notes_key_press(self, widget, event):
+        state = event.state & Gtk.accelerator_get_default_mod_mask()
+        # Ctrl+N: toggle notes off
+        if event.keyval == Gdk.KEY_n and state == Gdk.ModifierType.CONTROL_MASK:
+            self._toggle_notes()
+            return True
+        # Ctrl+Shift+S: screenshot
+        if (event.keyval in (Gdk.KEY_s, Gdk.KEY_S) and
+                state == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
+            self._on_screenshot_ocr()
+            return True
+        # Tab: return focus to entry
+        if event.keyval == Gdk.KEY_Tab and state == 0:
+            self.entry.grab_focus()
+            return True
+        # Escape: hide notes, return to entry
+        if event.keyval == Gdk.KEY_Escape:
+            self.notes_scroll.hide()
+            self._resize_window()
+            self.entry.grab_focus()
+            return True
+        return False
+
+    def _toggle_notes(self):
+        visible = self.notes_scroll.get_visible()
+        if visible:
+            self.notes_scroll.hide()
+            self.entry.grab_focus()
+        else:
+            self.notes_view.show()
+            self.notes_scroll.show()
+            self.notes_view.grab_focus()
+        self._resize_window()
+
+    def _reposition_window(self, height):
+        """Position window so bottom edge stays above the taskbar."""
+        geo = self._monitor_geo
+        x = geo.x + (geo.width - 600) // 2
+        y = geo.y + geo.height - self._bottom_margin - height
+        self.move(x, y)
+
+    def _resize_window(self):
+        def do_resize():
+            base = self._base_height or 48
+            notes_vis = self.notes_scroll.get_visible()
+            status_vis = self.status_label.get_visible()
+            h = base
+            notes_h = 0
+            status_h = 0
+            if notes_vis:
+                notes_h = self.notes_scroll.get_preferred_height()[1] + 4
+                h += notes_h
+            if status_vis:
+                status_h = self.status_label.get_preferred_height()[1] + 4
+                h += status_h
+            geo = self._monitor_geo
+            x = geo.x + (geo.width - 600) // 2
+            y = geo.y + geo.height - self._bottom_margin - h
+            # Force GTK to accept the smaller size
+            self.set_size_request(600, h)
+            gdk_win = self.get_window()
+            if gdk_win:
+                gdk_win.move_resize(x, y, 600, h)
+            else:
+                self.resize(600, h)
+                self._reposition_window(h)
+            return False
+        GLib.idle_add(do_resize)
+
+    def clean(self):
+        """Clear all content: entry, notes, metadata tags, and status."""
+        self.entry.set_text("")
+        self.notes_view.get_buffer().set_text("")
+        self.notes_scroll.hide()
+        self.metadata_tags.clear()
+        self._render_tags()
+        self.status_label.hide()
+        self._ensure_default_today_tag()
+        self._resize_window()
+        self.entry.grab_focus()
+
+    def toggle_visibility(self):
+        """Toggle window visibility. Only hide if widget is focused, otherwise bring to front."""
+        if self.get_visible() and self.is_active():
+            self.hide()
+        elif self.get_visible():
+            # Visible but not focused — bring to front
+            self.present_with_time(Gdk.CURRENT_TIME)
+            self.set_keep_above(True)
+            gdk_win = self.get_window()
+            if gdk_win:
+                gdk_win.focus(Gdk.CURRENT_TIME)
+            self.entry.grab_focus()
+        else:
+            # Hidden — show it
+            self._notes_was_visible = self.notes_scroll.get_visible()
+            self.show_all()
+            self.status_label.hide()
+            if not self._notes_was_visible:
+                self.notes_scroll.hide()
+            self.present_with_time(Gdk.CURRENT_TIME)
+            self.set_keep_above(True)
+            gdk_win = self.get_window()
+            if gdk_win:
+                gdk_win.focus(Gdk.CURRENT_TIME)
+            self._resize_window()
+            self.entry.grab_focus()
+
     def _build_submit_title(self):
         """Build the full title with shortcut strings appended for the API."""
         title = self.entry.get_text().strip()
@@ -501,6 +717,8 @@ class QuickAddWindow(Gtk.Window):
         return title
 
     def _on_entry_key_press(self, widget, event):
+        state = event.state & Gtk.accelerator_get_default_mod_mask()
+
         if self.autocomplete.get_visible():
             if event.keyval == Gdk.KEY_Down:
                 self.autocomplete.select_next()
@@ -515,8 +733,19 @@ class QuickAddWindow(Gtk.Window):
                 self.autocomplete.hide()
                 return True
 
+        # Ctrl+N: toggle notes field
+        if event.keyval == Gdk.KEY_n and state == Gdk.ModifierType.CONTROL_MASK:
+            self._toggle_notes()
+            return True
+
+        # Ctrl+Shift+S: screenshot OCR
+        if (event.keyval in (Gdk.KEY_s, Gdk.KEY_S) and
+                state == (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
+            self._on_screenshot_ocr()
+            return True
+
         if event.keyval == Gdk.KEY_Escape:
-            Gtk.main_quit()
+            self.hide()
             return True
         return False
 
@@ -525,9 +754,21 @@ class QuickAddWindow(Gtk.Window):
     def _on_submit(self, widget):
         if self.autocomplete.get_visible():
             return
+
+        text = self.entry.get_text().strip()
+
+        # Handle /clean command
+        if text.lower() == "/clean":
+            self.clean()
+            return
+
         full_title = self._build_submit_title()
         if not full_title.strip():
             return
+
+        # Extract note text
+        buf = self.notes_view.get_buffer()
+        note_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
 
         self._last_display_title = self.entry.get_text().strip()
         self.entry.set_sensitive(False)
@@ -535,7 +776,10 @@ class QuickAddWindow(Gtk.Window):
 
         def do_add():
             try:
-                api_post("addTask", {"title": full_title})
+                payload = {"title": full_title}
+                if note_text:
+                    payload["note"] = note_text
+                api_post("addTask", payload)
                 GLib.idle_add(self._on_task_added, full_title)
             except Exception as e:
                 GLib.idle_add(self._on_task_error, str(e))
@@ -550,9 +794,17 @@ class QuickAddWindow(Gtk.Window):
         self.entry.set_text("")
         self.metadata_tags.clear()
         self._render_tags()
+        self.notes_view.get_buffer().set_text("")
+        self.notes_scroll.hide()
+        self._ensure_default_today_tag()
+        self._resize_window()
         self.entry.set_sensitive(True)
         self.entry.grab_focus()
-        GLib.timeout_add(800, Gtk.main_quit)
+        GLib.timeout_add(3000, self._clear_status)
+
+    def _clear_status(self):
+        self.status_label.hide()
+        return False
 
     def _notify_widget_refresh(self, display_title, tags):
         """Write optimistic task data and send SIGUSR2 to the widget."""
@@ -601,30 +853,332 @@ class QuickAddWindow(Gtk.Window):
             f'<span foreground="{color}">{GLib.markup_escape_text(text)}</span>'
         )
         self.status_label.show()
+        self._resize_window()
 
-    # ── Focus ────────────────────────────────────────────────────────────
+    # ── Screenshot OCR ──────────────────────────────────────────────────
 
-    def _on_focus_out(self, widget, event):
-        GLib.timeout_add(200, self._check_focus)
+    def _on_screenshot_ocr(self):
+        if not ANTHROPIC_API_KEY:
+            self._set_status("No anthropic_api_key in config.json", "#f38ba8")
+            return
+        logging.info("Screenshot: hiding window for capture")
+        self.hide()
+        GLib.timeout_add(200, self._do_screenshot)
+
+    def _do_screenshot(self):
+        self._screenshot_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        self._screenshot_tmp.close()
+        self._try_portal_screenshot()
         return False
 
-    def _check_focus(self):
-        if not self.is_active() and not self.autocomplete.get_visible():
-            Gtk.main_quit()
+    def _try_portal_screenshot(self):
+        """Use xdg-desktop-portal Screenshot (works on Wayland)."""
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+            self._portal_bus = bus
+            token = f"marvin_{os.getpid()}"
+
+            # The portal rewrites the handle using the sender's unique name,
+            # replacing ":" with "" and "." with "_".
+            unique = bus.get_unique_name()  # e.g. ":1.234"
+            sender_part = unique.lstrip(":").replace(".", "_")
+            handle = f"/org/freedesktop/portal/desktop/request/{sender_part}/{token}"
+            logging.info(f"Screenshot: subscribing to portal signal at {handle}")
+
+            self._portal_sub = bus.signal_subscribe(
+                "org.freedesktop.portal.Desktop",
+                "org.freedesktop.portal.Request",
+                "Response",
+                handle,
+                None,
+                Gio.DBusSignalFlags.NO_MATCH_RULE,
+                self._on_portal_response,
+                None,
+            )
+
+            result = bus.call_sync(
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Screenshot",
+                "Screenshot",
+                GLib.Variant("(sa{sv})", ("", {
+                    "interactive": GLib.Variant("b", True),
+                    "handle_token": GLib.Variant("s", token),
+                })),
+                GLib.VariantType("(o)"),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+            actual_handle = result.unpack()[0]
+            logging.info(f"Screenshot: portal returned handle {actual_handle}")
+
+            # If the portal returned a different handle, re-subscribe
+            if actual_handle != handle:
+                logging.info(f"Screenshot: re-subscribing to actual handle {actual_handle}")
+                bus.signal_unsubscribe(self._portal_sub)
+                self._portal_sub = bus.signal_subscribe(
+                    "org.freedesktop.portal.Desktop",
+                    "org.freedesktop.portal.Request",
+                    "Response",
+                    actual_handle,
+                    None,
+                    Gio.DBusSignalFlags.NO_MATCH_RULE,
+                    self._on_portal_response,
+                    None,
+                )
+
+            self._portal_timeout_id = GLib.timeout_add(30000, self._on_portal_timeout)
+        except Exception as e:
+            logging.error(f"Screenshot: portal failed: {e}", exc_info=True)
+            self._fallback_screenshot_tools()
+
+    def _on_portal_response(self, bus, sender, path, iface, signal, params, user_data):
+        logging.info(f"Screenshot: portal response received on {path}")
+        bus.signal_unsubscribe(self._portal_sub)
+        if hasattr(self, "_portal_timeout_id"):
+            GLib.source_remove(self._portal_timeout_id)
+
+        response, results = params.unpack()
+        logging.info(f"Screenshot: portal response={response}, results={results}")
+
+        if response != 0:
+            logging.warning(f"Screenshot: portal cancelled (response={response})")
+            GLib.idle_add(self._on_screenshot_cancelled)
+            self._cleanup_screenshot_tmp()
+            return
+
+        uri = results.get("uri", "")
+        if not uri:
+            logging.warning("Screenshot: portal returned empty URI")
+            GLib.idle_add(self._on_screenshot_cancelled)
+            self._cleanup_screenshot_tmp()
+            return
+
+        from urllib.parse import unquote, urlparse
+        parsed = urlparse(uri)
+        filepath = unquote(parsed.path) if parsed.scheme == "file" else uri
+        logging.info(f"Screenshot: captured to {filepath}")
+        try:
+            with open(filepath, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode()
+            logging.info(f"Screenshot: image loaded ({len(img_data)} bytes b64), sending to Haiku")
+            # Show window immediately with processing status
+            GLib.idle_add(self._show_and_status, "Analyzing screenshot...", "#a6adc8")
+            threading.Thread(target=self._call_haiku_ocr, args=(img_data,), daemon=True).start()
+        except Exception as e:
+            logging.error(f"Screenshot: failed to read image: {e}", exc_info=True)
+            GLib.idle_add(self._on_screenshot_error, str(e))
+        self._cleanup_screenshot_tmp()
+
+    def _on_portal_timeout(self):
+        logging.warning("Screenshot: portal timeout (30s), giving up")
+        if hasattr(self, "_portal_sub"):
+            self._portal_bus.signal_unsubscribe(self._portal_sub)
+        self._on_screenshot_cancelled()
+        self._cleanup_screenshot_tmp()
         return False
+
+    def _fallback_screenshot_tools(self):
+        """Try CLI screenshot tools as fallback."""
+        def capture():
+            tmp_path = self._screenshot_tmp.name
+            commands = [
+                ["gnome-screenshot", "-a", "-f", tmp_path],
+                ["scrot", "-s", tmp_path],
+                ["maim", "-s", tmp_path],
+                ["import", tmp_path],
+            ]
+            for cmd in commands:
+                if shutil.which(cmd[0]) is None:
+                    continue
+                logging.info(f"Screenshot: trying fallback {cmd[0]}")
+                try:
+                    result = subprocess.run(cmd, timeout=30, capture_output=True)
+                    if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                        with open(tmp_path, "rb") as f:
+                            img_data = base64.b64encode(f.read()).decode()
+                        logging.info(f"Screenshot: {cmd[0]} succeeded")
+                        GLib.idle_add(self._show_and_status, "Analyzing screenshot...", "#a6adc8")
+                        self._call_haiku_ocr(img_data)
+                        return
+                    else:
+                        logging.warning(f"Screenshot: {cmd[0]} failed (rc={result.returncode})")
+                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    logging.warning(f"Screenshot: {cmd[0]} error: {e}")
+                    continue
+            logging.error("Screenshot: no screenshot tool available")
+            GLib.idle_add(self._on_screenshot_error, "No screenshot tool available")
+            self._cleanup_screenshot_tmp()
+
+        threading.Thread(target=capture, daemon=True).start()
+
+    def _cleanup_screenshot_tmp(self):
+        try:
+            os.unlink(self._screenshot_tmp.name)
+        except OSError:
+            pass
+
+    def _call_haiku_ocr(self, img_base64):
+        config = load_config()
+        category_hints = config.get("category_hints", {})
+        user_names = config.get("user_names", [])
+
+        cat_lines = []
+        for c in self.categories:
+            hint = category_hints.get(c["title"], "")
+            if hint:
+                cat_lines.append(f'- {c["title"]}: {hint}')
+            else:
+                cat_lines.append(f'- {c["title"]}')
+        cat_block = "\n".join(cat_lines) if cat_lines else "none loaded"
+
+        user_context = ""
+        if user_names:
+            names = ", ".join(user_names)
+            user_context = (
+                f"IMPORTANT: The user creating this task is: {names}. "
+                "Any of these names refer to the SAME person — the user themselves. "
+                "Create tasks from THEIR perspective (first person). "
+                "Do NOT create tasks like 'Review X's PR' when X is the user — "
+                "instead focus on what the user needs from others or what they need to do next.\n\n"
+            )
+
+        prompt_text = (
+            f"{user_context}"
+            "Analyze this screenshot and create an actionable task from it. "
+            "If it's a chat or conversation, use older messages for context but create the task "
+            "based on the MOST RECENT messages — what needs action NOW. "
+            "Think about what the user likely needs to DO based on what you see. "
+            "For example: if it's an error message, the task is to fix it; "
+            "if it's a chat message, the task is to follow up or respond to the latest message; "
+            "if it's a document, the task might be to review or complete it.\n\n"
+            f"Available project categories (use ONLY one of these exact names, or null if none fit):\n{cat_block}\n\n"
+            "Return ONLY valid JSON (no markdown, no code fences):\n"
+            '{"title": "short actionable task title", '
+            '"notes": "relevant details extracted from the screenshot", '
+            '"category": "exact category name or null"}'
+        )
+
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": img_base64,
+                        },
+                    },
+                    {"type": "text", "text": prompt_text},
+                ],
+            }],
+        }
+        try:
+            logging.info("OCR: calling Haiku API...")
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode()
+            logging.info(f"OCR: raw API response: {raw[:300]}")
+            result = json.loads(raw)
+
+            if result.get("type") == "error":
+                err_msg = result.get("error", {}).get("message", "Unknown API error")
+                logging.error(f"OCR: API error response: {err_msg}")
+                GLib.idle_add(self._on_screenshot_error, err_msg)
+                return
+
+            text = result["content"][0]["text"].strip()
+            logging.info(f"OCR: Haiku text: {text[:200]}")
+
+            # Strip markdown code fences if present
+            import re
+            cleaned = re.sub(r'^```(?:json)?\s*', '', text)
+            cleaned = re.sub(r'\s*```$', '', cleaned).strip()
+
+            parsed = json.loads(cleaned)
+            title = parsed.get("title", "").strip()
+            notes = parsed.get("notes", "").strip()
+            category = parsed.get("category")
+            logging.info(f"OCR: title={title!r}, category={category!r}")
+            GLib.idle_add(self._on_ocr_result, title, notes, category)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            logging.error(f"OCR: HTTP {e.code}: {body[:300]}")
+            GLib.idle_add(self._on_screenshot_error, f"API HTTP {e.code}")
+        except Exception as e:
+            logging.error(f"OCR: error: {e}", exc_info=True)
+            GLib.idle_add(self._on_screenshot_error, str(e))
+
+    def _on_ocr_result(self, title, notes, category):
+        self._reshow_window()
+        self.entry.handler_block_by_func(self._on_entry_changed)
+        self.entry.set_text(title)
+        self.entry.set_position(len(title))
+        self.entry.handler_unblock_by_func(self._on_entry_changed)
+        if notes:
+            self.notes_view.get_buffer().set_text(notes)
+            self.notes_view.show()
+            self.notes_scroll.show()
+        # Auto-add category tag if matched
+        if category:
+            cat = next((c for c in self.categories if c["title"].lower() == category.lower()), None)
+            if cat:
+                shortcut_str = f"#{cat['title']}"
+                tag_display = f"in {cat['title']}"
+                color = cat.get("color", "#888")
+                self.metadata_tags.append((shortcut_str, tag_display, color))
+                self._render_tags()
+        self._set_status("Task created from screenshot", "#a6e3a1")
+        self._resize_window()
+        self.entry.grab_focus()
+
+    def _reshow_window(self):
+        """Bring the window back after hiding for screenshot."""
+        self.show_all()
+        self.status_label.hide()
+        self.present_with_time(Gdk.CURRENT_TIME)
+        self.set_keep_above(True)
+
+    def _show_and_status(self, text, color):
+        self._reshow_window()
+        self._set_status(text, color)
+
+    def _on_screenshot_cancelled(self):
+        self._reshow_window()
+        self._set_status("Screenshot cancelled", "#a6adc8")
+        self.entry.grab_focus()
+
+    def _on_screenshot_error(self, error):
+        self._reshow_window()
+        self._set_status(f"Error: {error}", "#f38ba8")
+        self.entry.grab_focus()
 
 
 PIDFILE = os.path.expanduser("~/.cache/marvin-quick-add.pid")
 
 
 def ensure_single_instance():
-    """If already running, signal it to quit (toggle off), then exit."""
+    """If already running, signal it to toggle visibility, then exit."""
     if os.path.exists(PIDFILE):
         try:
             with open(PIDFILE) as f:
                 pid = int(f.read().strip())
             os.kill(pid, 0)  # Check alive
-            os.kill(pid, signal.SIGUSR1)  # Tell it to close
+            os.kill(pid, signal.SIGUSR1)  # Toggle visibility
             sys.exit(0)
         except (ProcessLookupError, ValueError):
             pass  # Stale PID
@@ -642,8 +1196,9 @@ def cleanup_pidfile():
 
 
 def main():
-    global API_TOKEN
+    global API_TOKEN, ANTHROPIC_API_KEY
     API_TOKEN = load_token()
+    ANTHROPIC_API_KEY = load_config().get("anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
 
     ensure_single_instance()
     import atexit
@@ -656,7 +1211,7 @@ def main():
     win.entry.grab_focus()
 
     def on_sigusr1(signum, frame):
-        GLib.idle_add(Gtk.main_quit)
+        GLib.idle_add(win.toggle_visibility)
 
     signal.signal(signal.SIGUSR1, on_sigusr1)
 

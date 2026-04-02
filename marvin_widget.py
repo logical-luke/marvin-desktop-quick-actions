@@ -398,7 +398,6 @@ _SHORTCUT_PATTERNS = [
     r'\breview\s+\S+',                 # review 2026-04-01
     r'\|\d+d',                         # |5d
     r'=\d+d',                          # =5d
-    r'--\S.*',                         # --note text
 ]
 _SHORTCUT_RE = re.compile('|'.join(f'(?:{p})' for p in _SHORTCUT_PATTERNS))
 
@@ -1064,7 +1063,13 @@ class MarvinWidget(Gtk.Window):
         title_label.set_xalign(0)
         if props:
             title_label.set_tooltip_text(_get_task_property_tooltip(task))
-        hbox.pack_start(title_label, True, True, 0)
+
+        # Wrap title in EventBox for double-click to edit
+        title_event = Gtk.EventBox()
+        title_event.add(title_label)
+        title_event.connect("button-press-event",
+            lambda w, e, tid=task_id, t=task: self._on_title_dblclick(w, e, tid, t))
+        hbox.pack_start(title_event, True, True, 0)
 
         # Live tracking timer (always visible on tracked task)
         if is_tracked:
@@ -1355,6 +1360,9 @@ class MarvinWidget(Gtk.Window):
         frame.get_style_context().add_class("task-card")
         task_id = task.get("_id")
 
+        # Right-click context menu (same as active tasks)
+        frame.connect("button-press-event", lambda w, e, t=task: self._on_task_right_click(w, e, t))
+
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
@@ -1419,6 +1427,12 @@ class MarvinWidget(Gtk.Window):
 
         vbox.pack_start(hbox, False, False, 0)
 
+        # Badges row: category + duration
+        badges_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        badges_box.set_margin_start(26)
+        badges_box.set_margin_top(2)
+        has_badges = False
+
         # Category badge
         parent_id = task.get("parentId")
         cat = self._resolve_category(parent_id)
@@ -1435,9 +1449,27 @@ class MarvinWidget(Gtk.Window):
             badge.get_style_context().add_provider(badge_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             badge.get_style_context().add_class("cat-badge")
             badge.set_halign(Gtk.Align.START)
-            badge.set_margin_start(26)
-            badge.set_margin_top(2)
-            vbox.pack_start(badge, False, False, 0)
+            badges_box.pack_start(badge, False, False, 0)
+            has_badges = True
+
+        # Duration badge
+        duration_ms = task.get("duration", 0) or 0
+        if duration_ms > 0:
+            dur_label = Gtk.Label()
+            dur_text = _format_duration(duration_ms)
+            dur_label.set_markup(f'<span font_size="x-small" weight="bold">\u23F1 {dur_text}</span>')
+            dur_css = Gtk.CssProvider()
+            dur_css.load_from_data(
+                b".dur-badge { background-color: #2d6a30; color: #ffffff; "
+                b"border-radius: 3px; padding: 2px 8px; }")
+            dur_label.get_style_context().add_provider(dur_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            dur_label.get_style_context().add_class("dur-badge")
+            dur_label.set_halign(Gtk.Align.START)
+            badges_box.pack_start(dur_label, False, False, 0)
+            has_badges = True
+
+        if has_badges:
+            vbox.pack_start(badges_box, False, False, 0)
 
         frame.add(vbox)
         return frame
@@ -1476,9 +1508,13 @@ class MarvinWidget(Gtk.Window):
         task_id = task.get("_id")
         title = task.get("title", "")
 
-        # Mark done
-        item = Gtk.MenuItem(label="\u2714  Mark done")
-        item.connect("activate", lambda w: self._on_task_check(task_id))
+        # Mark done / undone
+        if task.get("done"):
+            item = Gtk.MenuItem(label="\u21A9  Mark undone")
+            item.connect("activate", lambda w: self._on_task_uncheck(task_id))
+        else:
+            item = Gtk.MenuItem(label="\u2714  Mark done")
+            item.connect("activate", lambda w: self._on_task_check(task_id))
         menu.append(item)
 
         menu.append(Gtk.SeparatorMenuItem())
@@ -1748,6 +1784,46 @@ class MarvinWidget(Gtk.Window):
                 print(f"Failed to mark subtask done: {e}", file=sys.stderr)
 
         threading.Thread(target=do_update, daemon=True).start()
+
+    def _on_title_dblclick(self, widget, event, task_id, task):
+        """Double-click on title to edit it inline."""
+        if event.type != Gdk.EventType._2BUTTON_PRESS or event.button != 1:
+            return False
+
+        # Replace the label with an entry
+        label = widget.get_child()
+        old_title = task.get("title", "")
+        clean = _clean_title(old_title)
+
+        entry = Gtk.Entry()
+        entry.set_text(clean)
+        entry.get_style_context().add_class("subtask-entry")
+        entry.set_has_frame(False)
+
+        widget.remove(label)
+        widget.add(entry)
+        widget.show_all()
+        entry.grab_focus()
+        entry.select_region(0, -1)
+
+        def _save(e):
+            new_title = e.get_text().strip()
+            if new_title and new_title != clean:
+                self._action_update(task_id, {"title": new_title})
+            else:
+                # Revert — just re-render
+                self._render_tasks()
+
+        def _on_key(e, event):
+            if event.keyval == Gdk.KEY_Escape:
+                self._render_tasks()
+                return True
+            return False
+
+        entry.connect("activate", _save)
+        entry.connect("key-press-event", _on_key)
+        entry.connect("focus-out-event", lambda e, ev: _save(e))
+        return True
 
     def _on_track_btn_press(self, event, task_id, task):
         """Handle click/alt-click on the play button."""
@@ -2394,16 +2470,31 @@ class CategoryTimeWidget(Gtk.Window):
             self._list_box.show_all()
             return
 
-        # Aggregate duration by category
+        # Aggregate duration by category (resolve parentId to category id)
         all_tasks = self.store.tasks + self.store.done_tasks
         cat_durations = {}  # cat_id -> total_ms
+        uncategorized_ms = 0
         for t in all_tasks:
-            parent_id = t.get("parentId", "")
             dur = t.get("duration", 0) or 0
-            if parent_id:
-                cat_durations[parent_id] = cat_durations.get(parent_id, 0) + dur
+            if not dur:
+                continue
+            parent_id = t.get("parentId", "")
+            # Resolve to category id
+            cat_id = None
+            if parent_id and parent_id != "unassigned":
+                if parent_id in self.store.category_map:
+                    cat_id = parent_id
+                elif parent_id.startswith("#"):
+                    name = parent_id[1:].lower()
+                    cat = self.store.category_name_map.get(name)
+                    if cat:
+                        cat_id = cat["id"]
+            if cat_id:
+                cat_durations[cat_id] = cat_durations.get(cat_id, 0) + dur
+            else:
+                uncategorized_ms += dur
 
-        total_ms = sum(cat_durations.values())
+        total_ms = sum(cat_durations.values()) + uncategorized_ms
 
         # Build display list
         if self._show_all_cats:
@@ -2413,6 +2504,11 @@ class CategoryTimeWidget(Gtk.Window):
 
         # Sort by duration descending
         cats_to_show.sort(key=lambda c: cat_durations.get(c["id"], 0), reverse=True)
+
+        # Add uncategorized if there's tracked time without a category
+        if uncategorized_ms > 0:
+            cats_to_show.append({"id": "_uncategorized", "title": "Other", "color": "#666"})
+            cat_durations["_uncategorized"] = uncategorized_ms
 
         if not cats_to_show:
             empty = Gtk.Label(label="No time tracked today")

@@ -1,4 +1,12 @@
 {
     "api_token": "YOUR_API_TOKEN_HERE",
-    "full_access_token": "YOUR_FULL_ACCESS_TOKEN_HERE"
+    "full_access_token": "YOUR_FULL_ACCESS_TOKEN_HERE",
+    "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY_HERE",
+    "category_hints": {
+        "Tools": "internal tooling, dev environment, scripts, CLI tools, debugging dev setup issues",
+        "Admin": "emails, organization, scheduling, administrative tasks",
+        "Lendable": "work tasks for Lendable (employer)",
+        "M1P": "work related projects",
+        "Chess": "chess practice, study, games"
+    }
 }
